@@ -1,0 +1,186 @@
+---
+title: "Applying differential expression analysis on miRNA using Deseq2"
+author: "Menna Arafat"
+date:  "2024-6-25"
+output: html_document
+---
+
+## load libraries
+
+```{r}
+suppressPackageStartupMessages({ 
+library(tidyverse)
+library(maftools)
+library(pheatmap)
+library(tibble)
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(DESeq2)
+library("pheatmap")
+library("dichromat")
+library("RColorBrewer")
+library(ComplexHeatmap)
+library(circlize)
+library(stats)
+library(ggrepel)
+})
+```
+
+## create output directory
+
+```{r}
+dir.create("output")
+```
+
+## load data
+
+```{r}
+data= read.csv("data/raw_mirna_data.csv") %>% column_to_rownames("miRNA_ID") 
+names(data) %>% head()
+```
+
+## #' ##  Assign tumor or normal states to samples using TCGA barcodes, in the fourth part 01-09 indicates tumor sample while 11-19 normal samples
+##   function that takes a vector of names and modify it
+
+```{r}
+modify_sample_name = function(sample.names) {
+  
+  modified_names= sapply(sample.names, function(name) {
+                name= gsub("read_count_", "", name)
+                #' ## get fourth part of sample id
+                fourth_part= strsplit(name, "\\.")[[1]][4]
+                #' ## #' ##   Clean the fourth part to keep only digits
+                fourth_num <- as.numeric(gsub("\\D", "", fourth_part))
+                
+                #' ## #' ##   Check conditions and modify names accordingly
+                if (!is.na(fourth_num) && fourth_num >= 0 && fourth_num <= 9) {
+                  return(paste0(name, "_Tumor"))
+                } else if (!is.na(fourth_num) && fourth_num >= 11 && fourth_num <= 19) {
+                  return(paste0(name, "_Normal"))
+                } else {
+                  return(name)  
+                }
+        })
+  return(unname(modified_names))
+}
+
+sample_names= modify_sample_name(names(data))
+sample_names %>% head(., n=150)
+mirna_data= setNames(data, sample_names)
+```
+
+##  create metadata
+
+```{r}
+metadata= data.frame(
+  sample= colnames(mirna_data),
+  condition= ifelse(grepl("Tumor", colnames(mirna_data)), "Tumor", "Normal")
+)
+
+metadata$condition= factor(metadata$condition, levels = c("Normal","Tumor" ))
+```
+
+## Deseq for normalizing data
+## #' ## construct DESeq dataset for disease status controlling for the source of sample/ biological batch effect:
+
+```{r}
+dataset <- DESeqDataSetFromMatrix(countData = mirna_data,
+                                  colData = metadata,
+                                  design = ~ condition )
+```
+
+## #' ## filter out genes with low reads
+
+```{r}
+dataset <- dataset[ rowSums(counts(dataset)) > 500, ]
+```
+
+## apply deseq model 
+
+```{r}
+dds <- DESeq(dataset)
+```
+
+## get normalized count
+### Deseq2 Normalization basis
+### The size factor is calculated by taking the median of the ratios of observed counts to geometric means of counts for each gene. This means that for each sample,
+### it measures how much the counts differ from the typical gene across all samples, which accounts for differences in sequencing depth.
+### Once the size factors are calculated, the raw counts for each gene in each sample are divided by the size factor of that sample. 
+
+
+```{r}
+norm.cts <- counts(dds, normalized=TRUE)
+write.csv(norm.cts, "output/mirna_normalized_deseq.csv")
+```
+
+## get coefficints of the model
+
+```{r}
+coef(dds) %>% head()
+```
+
+##  to bring the logFC of a gene to the general mean by estimating the overall dispersion of all genes in certain interval
+
+```{r}
+res <- lfcShrink(dds, coef=  "condition_Tumor_vs_Normal" , type="apeglm")
+```
+
+## summary for distribution of DE-genes
+
+```{r}
+summary(res)
+```
+
+## how many genes of adj p-values <= .05
+
+```{r}
+sum(res$padj <= 0.05 & abs(res$log2FoldChange) > log(3, base=2), na.rm=TRUE)
+sig= as.data.frame(res) %>% filter(., res$padj <= 0.05 & abs(res$log2FoldChange) >= log(3, base=2))
+
+write.csv(as.data.frame(res), "output/Deseq_res_mrna.csv")
+```
+
+##  3 - Volcano Plot (raw p-value)
+
+```{r}
+res= as.data.frame(res)
+res$Direction= ifelse( res$padj <= 0.05 & res$log2FoldChange > log(3, base=2) , "Up", 
+                     ifelse ( res$padj <= 0.05 & res$log2FoldChange < -log(3, base=2), "Down", "Non-Significant"))
+
+table(res$Direction)
+
+res= res %>% mutate(features= ifelse(res$Direction == "Up"| res$Direction == "Down", row.names(res), ""))
+res$log10padj= -log10(res$padj)
+
+xminma <- -10
+xmaxma <- 10
+
+yminma <- min(res$log2FoldChange) 
+ymaxma <- max(res$log2FoldChange) + 0.5
+
+volcano = ggplot(res, aes(x = log2FoldChange, y = log10padj, color = Direction, label= features)) +
+  geom_point(size = 1.2, alpha = 0.7) + geom_rug(alpha = 0.6) +
+  scale_color_manual(values = c("Up" = "#88226AFF", "Down" = "darkolivegreen" , "Non-significant" = "#2C3E50")) +                 
+  xlab('log2FoldChange') + ylab('-log10 adj.pvalue') +
+
+  scale_x_continuous(limits = c(xminma, xmaxma)) +
+  theme_bw() + 
+  theme(legend.title = element_blank()) +
+  geom_vline(xintercept = -log2(3), linetype = "dotted") +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = -log10(0.05)) +
+  geom_vline(xintercept = log2(3), linetype = "dotted") +
+  geom_text_repel(aes(label = features), 
+                  size = 3, 
+                  max.overlaps = 20, 
+                  segment.color = "grey50")
+  #' ##  geom_text(aes(label = ifelse(padj <= 0.05 & abs(log2FoldChange) > log2(3), features, "")), 
+  #' ##            hjust = -0.2, vjust = 0, size = 3, check_overlap = F)
+
+
+print(volcano)
+
+ggsave("output/Volcanoplot.jpg" ,plot = volcano , dpi = 600 , width = 7 , height = 4)
+```
+
